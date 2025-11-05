@@ -1,0 +1,70 @@
+package com.workflow.limit;
+
+import io.agroal.api.AgroalDataSource;
+import io.quarkus.logging.Log;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.concurrent.Callable;
+import java.util.concurrent.TimeoutException;
+
+/**
+ * A simple distributed lock service using PostgreSQL Advisory Locks.
+ * This is the simplest, most robust solution using your existing tech stack.
+ */
+@ApplicationScoped
+public class DistributedLockService {
+
+    @Inject
+    AgroalDataSource dataSource;
+
+    /**
+     * Tries to acquire a lock for a given key and execute a function.
+     * The lock is automatically released when the function completes or throws an error.
+     *
+     * @param lockKey The unique key to lock (e.g., customerId)
+     * @param protectedTask The Callable (function) to execute while holding the lock.
+     * @return The result from the protectedTask.
+     * @throws Exception If the protectedTask throws an exception.
+     * @throws TimeoutException If the lock cannot be acquired.
+     */
+    public <T> T tryWithLock(String lockKey, Callable<T> protectedTask) throws Exception {
+        // Advisory locks use a 64-bit integer. We can get a stable one
+        // from the string's hashcode, but we'll use a simple positive hash.
+        int lockId = Math.abs(lockKey.hashCode());
+
+        // We MUST use a raw JDBC connection because advisory locks are
+        // session-scoped. The lock is held as long as this connection is open
+        // and is automatically released when the connection is closed by the try-with-resources.
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+
+            Log.infof("Attempting to acquire lock for key '%s' (hash: %d)", lockKey, lockId);
+
+            // 1. Try to acquire the lock (non-blocking)
+            ResultSet rs = stmt.executeQuery("SELECT pg_try_advisory_lock(" + lockId + ")");
+            if (rs.next() && rs.getBoolean(1)) {
+                // 2. Lock Acquired!
+                Log.infof("Lock acquired for key '%s'", lockKey);
+                try {
+                    // Execute the protected code (e.g., your GET and UPDATE API calls)
+                    return protectedTask.call();
+                } finally {
+                    // 3. Release the lock.
+                    // This is technically optional if the connection is closing,
+                    // but it's good practice to be explicit.
+                    stmt.execute("SELECT pg_advisory_unlock(" + lockId + ")");
+                    Log.infof("Lock released for key '%s'", lockKey);
+                }
+            } else {
+                // 4. Lock Not Acquired
+                // Someone else is processing this customer. Fail fast.
+                Log.warnf("Failed to acquire lock for key '%s'. Resource is busy.", lockKey);
+                throw new TimeoutException("Could not acquire lock for " + lockKey + ". The account is being updated by another process.");
+            }
+        }
+    }
+}
