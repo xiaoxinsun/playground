@@ -1,0 +1,316 @@
+// Save this entire file as WorkflowResource.java
+
+import org.squirrelframework.foundation.fsm.Condition;
+import org.squirrelframework.foundation.fsm.StateMachineBuilder;
+import org.squirrelframework.foundation.fsm.StateMachineBuilderFactory;
+import org.squirrelframework.foundation.fsm.UntypedStateMachine;
+import org.squirrelframework.foundation.fsm.annotation.StateMachineParameters;
+import org.squirrelframework.foundation.fsm.impl.AbstractStateMachine;
+import org.squirrelframework.foundation.fsm.impl.AbstractUntypedStateMachine;
+
+import javax.annotation.PostConstruct;
+import javax.enterprise.context.ApplicationScoped;
+import javax.inject.Inject;
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Random;
+
+//
+// --- 1. JAX-RS Endpoint Class ---
+//
+@Path("/workflow")
+public class WorkflowResource {
+
+    @Inject
+    MyWorkflowEngine engine;
+
+    /**
+     * A robust endpoint to run a workflow instance
+     * by feeding it a series of actions (as a JSON array).
+     */
+    @POST
+    @Path("/run/{workflowId}")
+    public String runWorkflow(@PathParam("workflowId") String workflowId, List<String> actions) {
+
+        // 1. Start the correct workflow instance
+        UntypedStateMachine fsm;
+        try {
+            fsm = engine.startWorkflowInstance(workflowId);
+        } catch (Exception e) {
+            return "Error: " + e.getMessage();
+        }
+
+        StringBuilder log = new StringBuilder();
+        log.append("Started workflow '").append(workflowId).append("'. Initial state: ").append(fsm.getCurrentState()).append("\n");
+
+        // 2. Fire the START_FLOW event
+        // We use a convention where the start event name is "START_FLOW"
+        // but it comes from different enums.
+        Object startEvent;
+        Object completeEvent;
+
+        if ("order".equals(workflowId)) {
+            startEvent = OrderFlowEvent.START_FLOW;
+            completeEvent = OrderFlowEvent.COMPLETE;
+        } else if ("approval".equals(workflowId)) {
+            startEvent = WorkflowEvent.START_FLOW;
+            completeEvent = WorkflowEvent.COMPLETE_TASK;
+        } else {
+            return "Error: Unknown workflow ID for event mapping.";
+        }
+
+        fsm.fire(startEvent, null);
+        log.append("Fired ").append(startEvent).append(". New state: ").append(fsm.getCurrentState()).append("\n");
+
+        // 3. Process the list of actions
+        for (String action : actions) {
+            if (fsm.isTerminated()) {
+                log.append("Workflow terminated. Ignoring further actions.\n");
+                break;
+            }
+
+            log.append(">>> Firing ").append(completeEvent).append(" with action '").append(action).append("'...\n");
+            fsm.fire(completeEvent, new TaskContext(action));
+            log.append("...New state: ").append(fsm.getCurrentState()).append("\n");
+        }
+
+        log.append("Workflow run finished. Final state: ").append(fsm.getCurrentState()).append("\n");
+        return log.toString();
+    }
+}
+
+//
+// --- 2. Workflow Engine (Singleton) ---
+//
+@ApplicationScoped
+class MyWorkflowEngine {
+
+    // Store multiple workflow definitions
+    private final Map<String, UntypedStateMachineBuilder> workflowBuilders = new HashMap<>();
+
+    @PostConstruct
+    public void defineWorkflows() {
+        defineApprovalWorkflow();
+        defineOrderWorkflow();
+    }
+
+    /**
+     * Starts a new instance of a workflow from a definition.
+     */
+    public UntypedStateMachine startWorkflowInstance(String workflowId) {
+        UntypedStateMachineBuilder builder = workflowBuilders.get(workflowId);
+        if (builder == null) {
+            throw new NoSuchElementException("No workflow definition found for ID: " + workflowId);
+        }
+        Object initialState = builder.getInitialState();
+        return builder.newStateMachine(initialState);
+    }
+
+    // --- Workflow Definition 1: Approval (Simple) ---
+    private void defineApprovalWorkflow() {
+        UntypedStateMachineBuilder builder = StateMachineBuilderFactory.create(
+                MyStateMachine.class, WorkflowState.class, WorkflowEvent.class, TaskContext.class);
+
+        builder.externalTransition().from(WorkflowState.START).to(WorkflowState.APPROVAL_TASK).on(WorkflowEvent.START_FLOW);
+        builder.externalTransition().from(WorkflowState.APPROVAL_TASK).to(WorkflowState.TASK_B).on(WorkflowEvent.COMPLETE_TASK).when(ActionCondition.is("approve"));
+        builder.externalTransition().from(WorkflowState.APPROVAL_TASK).to(WorkflowState.REJECTED_END).on(WorkflowEvent.COMPLETE_TASK).when(ActionCondition.is("reject"));
+        builder.externalTransition().from(WorkflowState.TASK_B).to(WorkflowState.APPROVED_END).on(WorkflowEvent.COMPLETE_TASK).when(ActionCondition.is("done"));
+
+        builder.onEntry(WorkflowState.APPROVAL_TASK).callMethod("onEntryApprovalTask");
+        builder.onEntry(WorkflowState.TASK_B).callMethod("onEntryTaskB");
+
+        builder.terminateState(WorkflowState.APPROVED_END);
+        builder.terminateState(WorkflowState.REJECTED_END);
+        builder.terminateState(WorkflowState.COMPLETED_END); // Example of another end state
+
+        workflowBuilders.put("approval", builder);
+    }
+
+    // --- Workflow Definition 2: Order Flow (Complex) ---
+    private void defineOrderWorkflow() {
+        UntypedStateMachineBuilder builder = StateMachineBuilderFactory.create(
+                OrderFlowStateMachine.class, OrderFlowState.class, OrderFlowEvent.class, TaskContext.class);
+
+        builder.externalTransition().from(OrderFlowState.START).to(OrderFlowState.CREATE_ORDER).on(OrderFlowEvent.START_FLOW);
+        builder.externalTransition().from(OrderFlowState.CREATE_ORDER).to(OrderFlowState.SETTLEMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("success"));
+        builder.externalTransition().from(OrderFlowState.CREATE_ORDER).to(OrderFlowState.INVESTMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("failure"));
+        builder.externalTransition().from(OrderFlowState.SETTLEMENT_MAKER).to(OrderFlowState.SETTLEMENT_CHECKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("submit"));
+        builder.externalTransition().from(OrderFlowState.SETTLEMENT_CHECKER).to(OrderFlowState.END_APPROVED).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("approve"));
+        builder.externalTransition().from(OrderFlowState.SETTLEMENT_CHECKER).to(OrderFlowState.END_REJECTED).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("reject"));
+        builder.externalTransition().from(OrderFlowState.SETTLEMENT_CHECKER).to(OrderFlowState.SETTLEMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("send_back"));
+        builder.externalTransition().from(OrderFlowState.INVESTMENT_MAKER).to(OrderFlowState.INVESTMENT_CHECKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("submit"));
+        builder.externalTransition().from(OrderFlowState.INVESTMENT_CHECKER).to(OrderFlowState.SETTLEMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("approve"));
+        builder.externalTransition().from(OrderFlowState.INVESTMENT_CHECKER).to(OrderFlowState.END_REJECTED).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("reject"));
+        builder.externalTransition().from(OrderFlowState.INVESTMENT_CHECKER).to(OrderFlowState.INVESTMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("send_back"));
+
+        builder.onEntry(OrderFlowState.CREATE_ORDER).callMethod("onEntryCreateOrder");
+        builder.onEntry(OrderFlowState.SETTLEMENT_MAKER).callMethod("onEntrySettlementMaker");
+        builder.onEntry(OrderFlowState.SETTLEMENT_CHECKER).callMethod("onEntrySettlementChecker");
+        builder.onEntry(OrderFlowState.INVESTMENT_MAKER).callMethod("onEntryInvestmentMaker");
+        builder.onEntry(OrderFlowState.INVESTMENT_CHECKER).callMethod("onEntryInvestmentChecker");
+
+        builder.terminateState(OrderFlowState.END_APPROVED);
+        builder.terminateState(OrderFlowState.END_REJECTED);
+
+        workflowBuilders.put("order", builder);
+    }
+}
+
+//
+// --- 3. Helper Classes and Enums ---
+//
+
+// --- Data Objects ---
+
+/**
+ * The "completion argument" object passed when firing an event.
+ */
+class TaskContext {
+    private final String action;
+
+    public TaskContext(String action) {
+        this.action = action;
+    }
+
+    public String getAction() {
+        return action;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        TaskContext that = (TaskContext) o;
+        return Objects.equals(action, that.action);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(action);
+    }
+}
+
+/**
+ * The "Guard" condition that checks the action in the TaskContext.
+ */
+class ActionCondition implements Condition<TaskContext> {
+    private final String expectedAction;
+
+    private ActionCondition(String expectedAction) {
+        this.expectedAction = expectedAction;
+    }
+
+    public static ActionCondition is(String action) {
+        return new ActionCondition(action);
+    }
+
+    @Override
+    public boolean isSatisfied(TaskContext context) {
+        return context != null && expectedAction.equals(context.getAction());
+    }
+
+    @Override
+    public String name() {
+        return "ActionIs_" + expectedAction;
+    }
+}
+
+// --- Approval Workflow: State Machine Class & Enums ---
+
+@StateMachineParameters(stateType = WorkflowState.class, eventType = WorkflowEvent.class, contextType = TaskContext.class)
+class MyStateMachine extends AbstractUntypedStateMachine {
+
+    protected void onEntryApprovalTask(WorkflowState from, WorkflowState to, WorkflowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'APPROVAL_TASK' ======");
+        System.out.println("Waiting for 'approve' or 'reject'...");
+        System.out.println("===========================================");
+    }
+
+    protected void onEntryTaskB(WorkflowState from, WorkflowState to, WorkflowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'TASK_B' ======");
+        System.out.println("Task B auto-completing...");
+        System.out.println("====================================");
+        this.fire(WorkflowEvent.COMPLETE_TASK, new TaskContext("done"));
+    }
+}
+
+enum WorkflowState {
+    START,
+    APPROVAL_TASK,
+    TASK_B,
+    APPROVED_END,
+    REJECTED_END,
+    COMPLETED_END
+}
+
+enum WorkflowEvent {
+    START_FLOW,
+    COMPLETE_TASK
+}
+
+
+// --- Order Workflow: State Machine Class & Enums ---
+
+@StateMachineParameters(stateType = OrderFlowState.class, eventType = OrderFlowEvent.class, contextType = TaskContext.class)
+class OrderFlowStateMachine extends AbstractStateMachine<OrderFlowStateMachine, OrderFlowState, OrderFlowEvent, TaskContext> {
+
+    protected void onEntryCreateOrder(OrderFlowState from, OrderFlowState to, OrderFlowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'CREATE_ORDER' ======");
+        System.out.println("Processing order creation...");
+        
+        // Simulate success or failure
+        boolean isSuccess = new Random().nextBoolean(); 
+        String action = isSuccess ? "success" : "failure";
+        
+        System.out.println("Order creation result: " + action);
+        System.out.println("==========================================");
+        
+        this.fire(OrderFlowEvent.COMPLETE, new TaskContext(action));
+    }
+
+    protected void onEntrySettlementMaker(OrderFlowState from, OrderFlowState to, OrderFlowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'SETTLEMENT_MAKER' ======");
+        System.out.println("Waiting for settlement maker to 'submit'...");
+        System.out.println("==============================================");
+    }
+
+    protected void onEntrySettlementChecker(OrderFlowState from, OrderFlowState to, OrderFlowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'SETTLEMENT_CHECKER' ======");
+        System.out.println("Waiting for checker action ('approve', 'reject', 'send_back')...");
+        System.out.println("====================================================");
+    }
+
+    protected void onEntryInvestmentMaker(OrderFlowState from, OrderFlowState to, OrderFlowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'INVESTMENT_MAKER' ======");
+        System.out.println("Waiting for investment maker to 'submit'...");
+        System.out.println("===============================================");
+    }
+
+    protected void onEntryInvestmentChecker(OrderFlowState from, OrderFlowState to, OrderFlowEvent event, TaskContext context) {
+        System.out.println("====== [NODE LISTENER] 'INVESTMENT_CHECKER' ======");
+        System.out.println("Waiting for checker action ('approve', 'reject', 'send_back')...");
+        System.out.println("=====================================================");
+    }
+}
+
+enum OrderFlowState {
+    START,
+    CREATE_ORDER,
+    SETTLEMENT_MAKER,
+    SETTLEMENT_CHECKER,
+    INVESTMENT_MAKER,
+    INVESTMENT_CHECKER,
+    END_APPROVED,
+    END_REJECTED
+}
+
+enum OrderFlowEvent {
+    START_FLOW,
+    COMPLETE
+}
