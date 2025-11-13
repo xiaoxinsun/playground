@@ -1,0 +1,246 @@
+// Save this entire file as WorkflowResource.java
+
+import org.squirrelframework.foundation.fsm.Condition;
+import org.squirrelframework.foundation.fsm.DotVisitor; // <-- Import for visualization
+import org.squirrelframework.foundation.fsm.StateMachineBuilder;
+import org.squirrelframework.foundation.fsm.StateMachineBuilderFactory;
+import org.squirrelframework.foundation.fsm.annotation.StateMachineParameters;
+import org.squirrelframework.foundation.fsm.impl.AbstractStateMachine;
+
+import javax.annotation.PostConstruct;
+import javax.enterprise.context.ApplicationScoped;
+import javax.inject.Inject;
+import javax.ws.rs.GET; // <-- Import for GET
+import javax.ws.rs.POST;
+import javax.ws.rs.Path;
+import javax.ws.rs.Produces;
+import javax.ws.rs.core.MediaType;
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Random;
+import java.util.Set;
+
+//
+// --- 1. JAX-RS Endpoint Class ---
+//
+@Path("/workflow")
+@Produces(MediaType.APPLICATION_JSON)
+public class WorkflowResource {
+
+    @Inject
+    MyWorkflowEngine engine;
+
+    /**
+     * Starts the "order" workflow.
+     */
+    @POST
+    @Path("/start")
+    public WorkflowStepResponse startWorkflow() {
+        // 1. Get a new FSM instance and fire the START event
+        OrderFlowStateMachine fsm = engine.startWorkflowInstance();
+        fsm.fire(OrderFlowEvent.START_FLOW, null);
+
+        OrderFlowState currentState = fsm.getCurrentState();
+        System.out.println("[API] Workflow started. Initial state: " + currentState);
+
+        // 2. Perform the business logic for the 'CREATE_ORDER' node
+        System.out.println("[API-Logic] Processing 'CREATE_ORDER' logic...");
+        boolean isSuccess = new Random().nextBoolean();
+        String action = isSuccess ? "success" : "failure";
+        System.out.println("[API-Logic] 'CREATE_ORDER' result: " + action);
+
+        // 3. Ask the engine for the *next* state based on this logic
+        WorkflowStepResponse response = engine.getNextState(currentState, action);
+
+        System.out.println("[API] 'CREATE_ORDER' auto-completed. New state: " + response.getNewState());
+        return response;
+    }
+
+    /**
+     * Completes the current active node and moves to the next.
+     */
+    @POST
+    @Path("/step")
+    public WorkflowStepResponse stepWorkflow(WorkflowStepRequest request) {
+        System.out.println("[API] Received step request. Current: " + request.getCurrentState() + ", Action: " + request.getAction());
+        WorkflowStepResponse response = engine.getNextState(request.getCurrentState(), request.getAction());
+        System.out.println("[API] Step complete. New state: " + response.getNewState());
+        return response;
+    }
+
+    /**
+     * NEW: Endpoint to generate the workflow visualization.
+     */
+    @GET
+    @Path("/visualize")
+    @Produces(MediaType.TEXT_PLAIN) // Produces DOT graph text
+    public String visualizeWorkflow() {
+        return engine.getWorkflowDotDefinition();
+    }
+}
+
+//
+// --- 2. Workflow Engine (Singleton) ---
+//
+@ApplicationScoped
+class MyWorkflowEngine {
+
+    // Fully typed builder for the OrderFlow
+    private StateMachineBuilder<OrderFlowStateMachine, OrderFlowState, OrderFlowEvent, TaskContext> orderWorkflowBuilder;
+    
+    private final Set<OrderFlowState> terminalStates = new HashSet<>();
+
+    @PostConstruct
+    public void defineWorkflows() {
+        defineOrderWorkflow();
+    }
+
+    /**
+     * Creates a new state machine instance starting at its initial state.
+     */
+    public OrderFlowStateMachine startWorkflowInstance() {
+        // We know the start state is START, so we pass it
+        return orderWorkflowBuilder.newStateMachine(OrderFlowState.START);
+    }
+
+    /**
+     * This is the core "stateless" function.
+     */
+    public WorkflowStepResponse getNextState(OrderFlowState currentState, String action) {
+        // Create a new FSM instance *at the specified current state*
+        OrderFlowStateMachine fsm = orderWorkflowBuilder.newStateMachine(currentState);
+
+        // Fire the "COMPLETE" event with the given action
+        fsm.fire(OrderFlowEvent.COMPLETE, new TaskContext(action));
+
+        // Get the new state (no casting needed!)
+        OrderFlowState newState = fsm.getCurrentState();
+
+        // Check if this new state is a terminal state
+        boolean isTerminated = terminalStates.contains(newState);
+
+        return new WorkflowStepResponse(newState, isTerminated);
+    }
+
+    /**
+     * NEW: Generates a DOT graph definition string.
+     */
+    public String getWorkflowDotDefinition() {
+        // 1. Create a DotVisitor
+        DotVisitor visitor = new DotVisitor();
+        
+        // 2. Create a dummy FSM instance (to be visited)
+        OrderFlowStateMachine fsm = orderWorkflowBuilder.newStateMachine(OrderFlowState.START);
+        
+        // 3. Run the visitor on the FSM instance
+        fsm.accept(visitor);
+        
+        // 4. Get the resulting string
+        return visitor.getDotDefinition();
+    }
+
+    // --- Workflow Definition: Order Flow ---
+    private void defineOrderWorkflow() {
+        // Use the typed builder factory
+        orderWorkflowBuilder = StateMachineBuilderFactory.create(
+                OrderFlowStateMachine.class, OrderFlowState.class, OrderFlowEvent.class, TaskContext.class);
+
+        // All transitions defined (same as before)
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.START).to(OrderFlowState.CREATE_ORDER).on(OrderFlowEvent.START_FLOW);
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.CREATE_ORDER).to(OrderFlowState.SETTLEMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("success"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.CREATE_ORDER).to(OrderFlowState.INVESTMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("failure"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.SETTLEMENT_MAKER).to(OrderFlowState.SETTLEMENT_CHECKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("submit"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.SETTLEMENT_CHECKER).to(OrderFlowState.END_APPROVED).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("approve"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.SETTLEMENT_CHECKER).to(OrderFlowState.END_REJECTED).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("reject"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.SETTLEMENT_CHECKER).to(OrderFlowState.SETTLEMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("send_back"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.INVESTMENT_MAKER).to(OrderFlowState.INVESTMENT_CHECKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("submit"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.INVESTMENT_CHECKER).to(OrderFlowState.SETTLEMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("approve"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.INVESTMENT_CHECKER).to(OrderFlowState.END_REJECTED).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("reject"));
+        orderWorkflowBuilder.externalTransition().from(OrderFlowState.INVESTMENT_CHECKER).to(OrderFlowState.INVESTMENT_MAKER).on(OrderFlowEvent.COMPLETE).when(ActionCondition.is("send_back"));
+        
+        // Define and store terminal states
+        orderWorkflowBuilder.terminateState(OrderFlowState.END_APPROVED);
+        orderWorkflowBuilder.terminateState(OrderFlowState.END_REJECTED);
+        
+        terminalStates.add(OrderFlowState.END_APPROVED);
+        terminalStates.add(OrderFlowState.END_REJECTED);
+    }
+}
+
+//
+// --- 3. DTOs (Data Transfer Objects) ---
+//
+
+class WorkflowStepRequest {
+    private OrderFlowState currentState;
+    private String action;
+    // Getters and Setters
+    public OrderFlowState getCurrentState() { return currentState; }
+    public void setCurrentState(OrderFlowState currentState) { this.currentState = currentState; }
+    public String getAction() { return action; }
+    public void setAction(String action) { this.action = action; }
+}
+
+class WorkflowStepResponse {
+    private OrderFlowState newState;
+    private boolean isTerminated;
+    public WorkflowStepResponse(OrderFlowState newState, boolean isTerminated) {
+        this.newState = newState;
+        this.isTerminated = isTerminated;
+    }
+    // Getters
+    public OrderFlowState getNewState() { return newState; }
+    public boolean isTerminated() { return isTerminated; }
+}
+
+//
+// --- 4. Helper Classes and Enums ---
+//
+
+class TaskContext {
+    private final String action;
+    public TaskContext(String action) { this.action = action; }
+    public String getAction() { return action; }
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        TaskContext that = (TaskContext) o;
+        return Objects.equals(action, that.action);
+    }
+    @Override
+    public int hashCode() { return Objects.hash(action); }
+}
+
+class ActionCondition implements Condition<TaskContext> {
+    private final String expectedAction;
+    private ActionCondition(String expectedAction) { this.expectedAction = expectedAction; }
+    public static ActionCondition is(String action) { return new ActionCondition(action); }
+    @Override
+    public boolean isSatisfied(TaskContext context) {
+        return context != null && expectedAction.equals(context.getAction());
+    }
+    @Override
+    public String name() { return "ActionIs_" + expectedAction; }
+}
+
+@StateMachineParameters(stateType = OrderFlowState.class, eventType = OrderFlowEvent.class, contextType = TaskContext.class)
+class OrderFlowStateMachine extends AbstractStateMachine<OrderFlowStateMachine, OrderFlowState, OrderFlowEvent, TaskContext> {
+    // This is now just a type-safe marker class, as all logic is in the engine.
+}
+
+enum OrderFlowState {
+    START,
+    CREATE_ORDER,
+    SETTLEMENT_MAKER,
+    SETTLEMENT_CHECKER,
+    INVESTMENT_MAKER,
+    INVESTMENT_CHECKER,
+    END_APPROVED,
+    END_REJECTED
+}
+
+enum OrderFlowEvent {
+    START_FLOW,
+    COMPLETE
+}
