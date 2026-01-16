@@ -1,0 +1,32 @@
+import requests
+from langchain_core.tools import tool
+
+# 1. Define the tool
+@tool
+def get_crypto_price(symbol: str, currency: str = "usd") -> str:
+    """
+    Fetches the current price of a cryptocurrency from a public API.
+    
+    Args:
+        symbol: The crypto symbol (e.g., 'bitcoin', 'ethereum').
+        currency: The target currency to compare against (default: 'usd').
+    """
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={symbol}&vs_currencies={currency}"
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Check if data exists for the symbol
+        if symbol not in data:
+            return f"Error: Could not find data for symbol '{symbol}'."
+            
+        price = data[symbol][currency]
+        return f"The current price of {symbol} is {price} {currency.upper()}."
+        
+    except requests.exceptions.RequestException as e:
+        return f"API Request failed: {e}"
+
+# 2. Test the tool manually
+# print(get_crypto_price.invoke({"symbol": "bitcoin"}))
