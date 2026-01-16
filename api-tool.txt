@@ -1,3 +1,5 @@
+Approach 1
+~~~~~~~~~
 import requests
 from langchain_core.tools import tool
 
@@ -30,3 +32,71 @@ def get_crypto_price(symbol: str, currency: str = "usd") -> str:
 
 # 2. Test the tool manually
 # print(get_crypto_price.invoke({"symbol": "bitcoin"}))
+
+Approach 2
+~~~~~~~~~~~
+from typing import Type, Optional
+from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
+import requests
+
+# 1. Define the Input Schema
+class StockInput(BaseModel):
+    ticker: str = Field(description="The stock ticker symbol (e.g., AAPL)")
+
+# 2. Define the Tool Class
+class StockPriceTool(BaseTool):
+    name: str = "get_stock_price"
+    description: str = "Useful for getting the current price of a stock."
+    args_schema: Type[BaseModel] = StockInput
+    
+    def _run(self, ticker: str) -> str:
+        """Use the tool synchronously."""
+        # Simulating an API call here
+        # In reality, you would call requests.get(...)
+        if ticker.upper() == "AAPL":
+            return "185.50 USD"
+        elif ticker.upper() == "GOOGL":
+            return "140.20 USD"
+        else:
+            return f"Price for {ticker} not found."
+
+    def _arun(self, ticker: str):
+        """Use the tool asynchronously (optional but good for production apps)."""
+        raise NotImplementedError("This tool does not support async")
+
+# Instantiate the tool
+stock_tool = StockPriceTool()
+
+# Using the tool
+~~~~~~~~
+import os
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_tool_calling_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate
+
+# ... Insert the 'get_crypto_price' code from Method 1 here ...
+
+# 1. Setup the tools list
+tools = [get_crypto_price]
+
+# 2. Setup the LLM
+llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
+
+# 3. Create the Prompt Template
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a helpful financial assistant."),
+    ("human", "{input}"),
+    ("placeholder", "{agent_scratchpad}"),
+])
+
+# 4. Construct the Agent
+agent = create_tool_calling_agent(llm, tools, prompt)
+
+# 5. Create the Executor (The runtime for the agent)
+agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+
+# 6. Run it
+response = agent_executor.invoke({"input": "What is the price of ethereum right now?"})
+
+print(response['output'])
