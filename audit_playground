@@ -1,0 +1,321 @@
+@ApplicationScoped
+public class AuditService {
+    private final Javers javers;
+    
+    @Inject
+    AuditRepository auditRepository;
+    
+    @Inject
+    SecurityIdentity securityIdentity;
+    
+    public AuditService() {
+        // Simple, no special configuration
+        this.javers = JaversBuilder.javers().build();
+    }
+    
+    public <T> AuditRecord auditUpdate(T oldObject, T newObject) {
+        String userId = extractUserId(newObject);
+        LocalDateTime timestamp = extractUpdatedAtTimestamp(newObject);
+        
+        // Let JaVers diff everything
+        Diff diff = javers.compare(oldObject, newObject);
+        
+        if (!diff.hasChanges()) {
+            return null;
+        }
+        
+        // Filter out metadata fields after diffing
+        List<FieldChange> fieldChanges = diff.getChanges().stream()
+            .filter(change -> change instanceof ValueChange)
+            .map(change -> (ValueChange) change)
+            .filter(vc -> !isMetadataField(newObject.getClass(), vc.getPropertyNameWithPath()))
+            .map(vc -> new FieldChange(
+                // JaVers uses "/" for paths, convert to "."
+                vc.getPropertyNameWithPath().replace("/", "."),
+                vc.getLeft() != null ? vc.getLeft().toString() : null,
+                vc.getRight() != null ? vc.getRight().toString() : null
+            ))
+            .collect(Collectors.toList());
+        
+        if (fieldChanges.isEmpty()) {
+            return null; // Only metadata changed
+        }
+        
+        return persistAudit(newObject, userId, timestamp, "UPDATE", fieldChanges);
+    }
+    
+    public <T> AuditRecord auditCreation(T object) {
+        String userId = extractUserId(object);
+        LocalDateTime timestamp = extractCreatedAtTimestamp(object);
+        
+        List<FieldChange> fieldChanges = extractAllFieldsAsChanges(object, true);
+        
+        return persistAudit(object, userId, timestamp, "CREATE", fieldChanges);
+    }
+    
+    public <T> AuditRecord auditDeletion(T object) {
+        String userId = extractUserId(object);
+        LocalDateTime timestamp = extractUpdatedAtTimestamp(object);
+        
+        List<FieldChange> fieldChanges = extractAllFieldsAsChanges(object, false);
+        
+        return persistAudit(object, userId, timestamp, "DELETE", fieldChanges);
+    }
+    
+    // ========== Metadata Field Detection ==========
+    
+    private boolean isMetadataField(Class<?> rootClass, String propertyPath) {
+        // propertyPath examples from JaVers:
+        // "loanId"
+        // "doco/plannedDate"
+        // "loanExtension/extensionCount"
+        
+        String[] parts = propertyPath.split("/");
+        Class<?> currentClass = rootClass;
+        
+        for (int i = 0; i < parts.length; i++) {
+            String fieldName = parts[i];
+            
+            try {
+                Field field = currentClass.getDeclaredField(fieldName);
+                
+                // Check if this field is a metadata field
+                if (field.isAnnotationPresent(AuditBusinessKey.class) ||
+                    field.isAnnotationPresent(AuditCreatedBy.class) ||
+                    field.isAnnotationPresent(AuditCreatedAt.class) ||
+                    field.isAnnotationPresent(AuditUpdatedBy.class) ||
+                    field.isAnnotationPresent(AuditUpdatedAt.class)) {
+                    return true;
+                }
+                
+                // Check if marked as ignore
+                AuditField auditField = field.getAnnotation(AuditField.class);
+                if (auditField != null && auditField.ignore()) {
+                    return true;
+                }
+                
+                // If not the last part, navigate to nested type
+                if (i < parts.length - 1) {
+                    currentClass = field.getType();
+                }
+                
+            } catch (NoSuchFieldException e) {
+                // Field doesn't exist, skip
+                return false;
+            }
+        }
+        
+        return false;
+    }
+    
+    // ========== For CREATE/DELETE (no JaVers needed) ==========
+    
+    private <T> List<FieldChange> extractAllFieldsAsChanges(T object, boolean isCreation) {
+        return extractAllFieldsRecursive(object, isCreation, "");
+    }
+    
+    private List<FieldChange> extractAllFieldsRecursive(Object object, boolean isCreation, String prefix) {
+        if (object == null) {
+            return Collections.emptyList();
+        }
+        
+        List<FieldChange> changes = new ArrayList<>();
+        Class<?> clazz = object.getClass();
+        
+        for (Field field : clazz.getDeclaredFields()) {
+            // Skip metadata fields
+            if (isMetadataFieldByAnnotation(field)) {
+                continue;
+            }
+            
+            // Skip if explicitly ignored
+            AuditField auditField = field.getAnnotation(AuditField.class);
+            if (auditField != null && auditField.ignore()) {
+                continue;
+            }
+            
+            field.setAccessible(true);
+            try {
+                Object value = field.get(object);
+                String fieldPath = prefix.isEmpty() ? field.getName() : prefix + "." + field.getName();
+                
+                // Check if nested object
+                if (isNestedObject(field, value)) {
+                    List<FieldChange> nestedChanges = extractAllFieldsRecursive(value, isCreation, fieldPath);
+                    changes.addAll(nestedChanges);
+                } else if (value != null) {
+                    String stringValue = valueToString(value);
+                    changes.add(new FieldChange(
+                        fieldPath,
+                        isCreation ? null : stringValue,
+                        isCreation ? stringValue : null
+                    ));
+                }
+            } catch (IllegalAccessException e) {
+                // Skip this field
+            }
+        }
+        
+        return changes;
+    }
+    
+    private boolean isMetadataFieldByAnnotation(Field field) {
+        return field.isAnnotationPresent(AuditBusinessKey.class)
+            || field.isAnnotationPresent(AuditCreatedBy.class)
+            || field.isAnnotationPresent(AuditCreatedAt.class)
+            || field.isAnnotationPresent(AuditUpdatedBy.class)
+            || field.isAnnotationPresent(AuditUpdatedAt.class);
+    }
+    
+    private boolean isNestedObject(Field field, Object value) {
+        if (value == null) {
+            return false;
+        }
+        
+        Class<?> type = field.getType();
+        
+        // Not a nested object if it's a primitive, wrapper, or common type
+        if (type.isPrimitive() || 
+            type.isEnum() ||
+            type.equals(String.class) ||
+            type.equals(BigDecimal.class) ||
+            type.equals(LocalDate.class) ||
+            type.equals(LocalDateTime.class) ||
+            Number.class.isAssignableFrom(type)) {
+            return false;
+        }
+        
+        // Could also check for @AuditNested annotation if you want explicit marking
+        return true; // Assume it's a nested object
+    }
+    
+    // ========== Metadata Extraction ==========
+    
+    private <T> String extractUserId(T object) {
+        Class<?> clazz = object.getClass();
+        
+        // Try updatedBy first
+        for (Field field : clazz.getDeclaredFields()) {
+            if (field.isAnnotationPresent(AuditUpdatedBy.class)) {
+                field.setAccessible(true);
+                try {
+                    Object value = field.get(object);
+                    if (value != null) return value.toString();
+                } catch (IllegalAccessException e) {}
+            }
+        }
+        
+        // Then createdBy
+        for (Field field : clazz.getDeclaredFields()) {
+            if (field.isAnnotationPresent(AuditCreatedBy.class)) {
+                field.setAccessible(true);
+                try {
+                    Object value = field.get(object);
+                    if (value != null) return value.toString();
+                } catch (IllegalAccessException e) {}
+            }
+        }
+        
+        // Fallback to security context
+        if (securityIdentity != null && !securityIdentity.isAnonymous()) {
+            return securityIdentity.getPrincipal().getName();
+        }
+        
+        return "SYSTEM";
+    }
+    
+    private <T> LocalDateTime extractUpdatedAtTimestamp(T object) {
+        return extractTimestamp(object, AuditUpdatedAt.class);
+    }
+    
+    private <T> LocalDateTime extractCreatedAtTimestamp(T object) {
+        return extractTimestamp(object, AuditCreatedAt.class);
+    }
+    
+    private <T> LocalDateTime extractTimestamp(T object, Class<? extends Annotation> annotationClass) {
+        Class<?> clazz = object.getClass();
+        
+        for (Field field : clazz.getDeclaredFields()) {
+            if (field.isAnnotationPresent(annotationClass)) {
+                field.setAccessible(true);
+                try {
+                    Object value = field.get(object);
+                    if (value instanceof LocalDateTime) {
+                        return (LocalDateTime) value;
+                    }
+                } catch (IllegalAccessException e) {}
+            }
+        }
+        
+        return LocalDateTime.now(ZoneOffset.UTC);
+    }
+    
+    private String valueToString(Object value) {
+        if (value == null) {
+            return null;
+        }
+        
+        if (value instanceof LocalDateTime) {
+            return ((LocalDateTime) value).format(DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+        }
+        if (value instanceof LocalDate) {
+            return ((LocalDate) value).format(DateTimeFormatter.ISO_LOCAL_DATE);
+        }
+        if (value instanceof BigDecimal) {
+            return ((BigDecimal) value).toPlainString();
+        }
+        
+        return value.toString();
+    }
+    
+    // ========== Persistence ==========
+    
+    private <T> AuditRecord persistAudit(T object, String userId, LocalDateTime timestamp,
+                                          String operation, List<FieldChange> fieldChanges) {
+        String entityType = extractEntityType(object.getClass());
+        String businessKey = extractBusinessKey(object);
+        
+        AuditRecord record = new AuditRecord(
+            entityType,
+            businessKey,
+            userId,
+            timestamp,
+            operation,
+            fieldChanges
+        );
+        
+        auditRepository.persist(record);
+        return record;
+    }
+    
+    private String extractEntityType(Class<?> clazz) {
+        AuditEntity annotation = clazz.getAnnotation(AuditEntity.class);
+        if (annotation != null && !annotation.entityType().isEmpty()) {
+            return annotation.entityType();
+        }
+        return clazz.getSimpleName();
+    }
+    
+    private <T> String extractBusinessKey(T object) {
+        Class<?> clazz = object.getClass();
+        
+        for (Field field : clazz.getDeclaredFields()) {
+            if (field.isAnnotationPresent(AuditBusinessKey.class)) {
+                field.setAccessible(true);
+                try {
+                    Object value = field.get(object);
+                    return value != null ? value.toString() : null;
+                } catch (IllegalAccessException e) {
+                    throw new RuntimeException("Cannot access business key: " + field.getName(), e);
+                }
+            }
+        }
+        
+        throw new IllegalStateException("No @AuditBusinessKey found on " + clazz.getName());
+    }
+    
+    public List<AuditRecord> getAudits(String entityType, String businessKey) {
+        return auditRepository.find("entityType = ?1 and businessKey = ?2 order by changedAtUTC desc",
+                                   entityType, businessKey).list();
+    }
+}
